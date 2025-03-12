@@ -1,7 +1,6 @@
 #!/bin/bash
 # check consistent use of allowed functions or prohibited functions
 
-
 # =====================================================
 # ===== PIPEX FUNCTION VALIDATOR - ULTIMATE EDITION ===
 # =====================================================
@@ -27,16 +26,16 @@ PROHIBITED_FUNCTIONS=(
 )
 
 # Enhanced colors and styles
-RED='\033[1;31m'        # Bold Red
-GREEN='\033[1;32m'      # Bold Green
-YELLOW='\033[1;33m'     # Bold Yellow
-BLUE='\033[1;34m'       # Bold Blue
-CYAN='\033[1;36m'       # Bold Cyan
-PURPLE='\033[1;35m'     # Bold Purple
-WHITE='\033[1;37m'      # Bold White
-RESET='\033[0m'         # Reset
-BOLD='\033[1m'          # Bold
-DIM='\033[2m'           # Dim
+RED='\033[1;31m'  
+GREEN='\033[1;32m'  
+YELLOW='\033[1;33m'  
+BLUE='\033[1;34m'  
+CYAN='\033[1;36m'  
+PURPLE='\033[1;35m'  
+WHITE='\033[1;37m'  
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
 
 # Function to print stylish banners
 print_banner() {
