@@ -69,3 +69,6 @@ Add new assessment scripts in the `scripts/` directory:
 ## Contributing
 
 Feel free to contribute new scripts or improvements to the CLI interface!
+
+
+- [] ERROR : `*` regexp in --> char	*ft_hex_to_str(unsigned long int num, char *str, size_t len)
