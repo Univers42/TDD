@@ -11,7 +11,8 @@ ALLOWED_FUNCTIONS=(
     "malloc" "free" "perror" "strerror"
     "access" "dup" "dup2" "execve"
     "exit" "fork" "pipe" "unlink"
-    "wait" "waitpid" "printf"
+    "wait" "waitpid" "printf" "va_start"
+    "va_end" "va_arg" "va_start"
 )
 
 # Define explicitly prohibited functions that should be caught
@@ -121,10 +122,53 @@ ALL_FILES="$C_FILES $H_FILES"
 
 echo -e "${GREEN}✓ Found $(echo "$ALL_FILES" | wc -w) source files to analyze${RESET}"
 
-# Step 1: Extract all unique function calls from all files
-print_banner "PHASE 1: EXTRACTING FUNCTION CALLS" "$BLUE"
+# Step 1: First collect all static function definitions
+print_banner "PHASE 1: COLLECTING STATIC FUNCTIONS" "$BLUE"
+declare -A STATIC_FUNCTIONS
+declare -A STATIC_FUNCTIONS_FILE
+
+echo -e "${CYAN}Scanning for static function definitions...${RESET}"
+file_count=0
+total_files=$(echo "$ALL_FILES" | wc -w)
+start_time=$(date +%s)
+
+for file in $ALL_FILES; do
+    ((file_count++))
+    
+    # Show magnificent progress bar
+    current_time=$(date +%s)
+    elapsed=$((current_time - start_time))
+    show_progress_bar "$file_count" "$total_files" "Analyzing static functions:" "$elapsed"
+
+    # Create a temporary file without comments
+    TMP_FILE=$(mktemp)
+    sed 's/\/\/.*$//' "$file" | awk '/\/\*/{flag=1; next} /\*\//{flag=0; next} !flag{print}' > "$TMP_FILE"
+    
+    # Find static function definitions
+    while IFS= read -r line; do
+        # Look for static function declarations 
+        # This pattern matches both:
+        # - static type function_name(
+        # - static type *function_name(
+        # - static type function_name (
+        if [[ "$line" =~ ^[[:space:]]*static[[:space:]]+[a-zA-Z0-9_\*]+[[:space:]]+([a-zA-Z0-9_]+)[[:space:]]*\( ]]; then
+            func_name="${BASH_REMATCH[1]}"
+            STATIC_FUNCTIONS["$func_name"]=1
+            STATIC_FUNCTIONS_FILE["$func_name"]="$file"
+        fi
+    done < "$TMP_FILE"
+    
+    rm -f "$TMP_FILE"
+done
+echo # New line after progress display
+
+echo -e "${GREEN}✓ Found ${#STATIC_FUNCTIONS[@]} static functions${RESET}"
+
+# Step 2: Extract all function calls from all files
+print_banner "PHASE 2: EXTRACTING FUNCTION CALLS" "$YELLOW"
 declare -A FUNCTION_CALLS
 declare -A FUNCTION_CALL_LOCATIONS
+declare -A FUNCTION_CALLS_BY_FILE
 
 # Pre-process: Check for explicitly prohibited functions using grep
 echo -e "${CYAN}Performing quick scan for prohibited functions...${RESET}"
@@ -164,7 +208,7 @@ for file in $ALL_FILES; do
     # Show magnificent progress bar
     current_time=$(date +%s)
     elapsed=$((current_time - start_time))
-    show_progress_bar "$file_count" "$total_files" "Analyzing source files:" "$elapsed"
+    show_progress_bar "$file_count" "$total_files" "Analyzing function calls:" "$elapsed"
     
     # Process the file line by line to properly handle comments
     line_num=0
@@ -214,7 +258,10 @@ for file in $ALL_FILES; do
             # Record this function call
             FUNCTION_CALLS["$func_name"]=1
             
-            # Record where this function was called
+            # Record the file this function is called from (for static function validation)
+            FUNCTION_CALLS_BY_FILE["$func_name,$file"]=1
+            
+            # Record where this function was called (for reporting)
             if [[ -z "${FUNCTION_CALL_LOCATIONS[$func_name]}" ]]; then
                 FUNCTION_CALL_LOCATIONS["$func_name"]="$file:$line_num"
             else
@@ -227,8 +274,8 @@ echo # New line after progress display
 
 echo -e "${GREEN}✓ Found ${#FUNCTION_CALLS[@]} unique function calls${RESET}"
 
-# Step 2: Find all function definitions across all files
-print_banner "PHASE 2: IDENTIFYING FUNCTION DEFINITIONS" "$YELLOW"
+# Step 3: Find all regular function definitions across all files
+print_banner "PHASE 3: IDENTIFYING FUNCTION DEFINITIONS" "$PURPLE"
 declare -A FUNCTION_DEFINITIONS
 declare -A FUNCTION_DEF_LOCATIONS
 
@@ -316,20 +363,48 @@ for file in $C_FILES; do
     elapsed=$((current_time - start_time))
     show_progress_bar "$file_count" "$total_c_files" "Processing source definitions:" "$elapsed"
     
-    # First check for static functions - these are only visible within their file
-    while read -r line_num line; do
+    # Need to handle multi-line functions and different formatting styles
+    in_function=0
+    current_function=""
+    line_num=0
+    
+    while IFS= read -r line; do
+        ((line_num++))
+        
         # Skip comment lines and empty lines
         if [[ "$line" =~ ^[[:space:]]*(\*|\/\*|\*\/|\/\/) ]] || [[ -z "${line// /}" ]]; then
             continue
         fi
         
-        # Match static function definitions - these are local to their files
-        if [[ "$line" =~ ^[[:space:]]*static[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\( ]]; then
-            func_name="${BASH_REMATCH[1]}"
-            FUNCTION_DEFINITIONS["$func_name"]=1
-            FUNCTION_DEF_LOCATIONS["$func_name"]="$file:$line_num (static function)"
+        if [[ $in_function -eq 0 ]]; then
+            # Look for function definition start (return_type function_name( with no semicolon)
+            # Skip static functions as they're already handled
+            if [[ ! "$line" =~ ^[[:space:]]*static ]] && [[ "$line" =~ ^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\( ]] && [[ ! "$line" == *";"* ]]; then
+                func_name="${BASH_REMATCH[1]}"
+                
+                # If the line contains an opening brace, we found a single-line function start
+                if [[ "$line" == *"{"* ]]; then
+                    in_function=1
+                    current_function="$func_name"
+                    FUNCTION_DEFINITIONS["$func_name"]=1
+                    FUNCTION_DEF_LOCATIONS["$func_name"]="$file:$line_num (definition)"
+                else
+                    # Look ahead for the opening brace
+                    next_lines=$(head -n $((line_num + 10)) "$file" | tail -n 10)
+                    if [[ "$next_lines" == *"{"* ]]; then
+                        in_function=1
+                        current_function="$func_name"
+                        FUNCTION_DEFINITIONS["$func_name"]=1
+                        FUNCTION_DEF_LOCATIONS["$func_name"]="$file:$line_num (multi-line definition)"
+                    fi
+                fi
+            fi
+        elif [[ "$line" == *"}"* ]]; then
+            # End of function
+            in_function=0
+            current_function=""
         fi
-    done < <(grep -n "" "$file")
+    done < "$file"
     
     # Extract function parameters from function definitions
     while read -r line_num line; do
@@ -357,52 +432,10 @@ for file in $C_FILES; do
             fi
         done
     done < <(grep -n "" "$file")
-    
-    # Need to handle multi-line functions and different formatting styles
-    in_function=0
-    current_function=""
-    line_num=0
-    
-    while IFS= read -r line; do
-        ((line_num++))
-        
-        # Skip comment lines and empty lines
-        if [[ "$line" =~ ^[[:space:]]*(\*|\/\*|\*\/|\/\/) ]] || [[ -z "${line// /}" ]]; then
-            continue
-        fi
-        
-        if [[ $in_function -eq 0 ]]; then
-            # Look for function definition start (return_type function_name( with no semicolon)
-            if [[ "$line" =~ ^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\( ]] && [[ ! "$line" == *";"* ]]; then
-                func_name="${BASH_REMATCH[1]}"
-                
-                # If the line contains an opening brace, we found a single-line function start
-                if [[ "$line" == *"{"* ]]; then
-                    in_function=1
-                    current_function="$func_name"
-                    FUNCTION_DEFINITIONS["$func_name"]=1
-                    FUNCTION_DEF_LOCATIONS["$func_name"]="$file:$line_num (definition)"
-                else
-                    # Look ahead for the opening brace
-                    next_lines=$(head -n $((line_num + 10)) "$file" | tail -n 10)
-                    if [[ "$next_lines" == *"{"* ]]; then
-                        in_function=1
-                        current_function="$func_name"
-                        FUNCTION_DEFINITIONS["$func_name"]=1
-                        FUNCTION_DEF_LOCATIONS["$func_name"]="$file:$line_num (multi-line definition)"
-                    fi
-                fi
-            fi
-        elif [[ "$line" == *"}"* ]]; then
-            # End of function
-            in_function=0
-            current_function=""
-        fi
-    done < "$file"
 done
 echo # New line after C file processing
 
-# Handle special cases and static helpers
+# Handle special cases and variables
 echo -e "${CYAN}Processing edge cases...${RESET}"
 
 # Handle special case for variable-like names
@@ -438,10 +471,10 @@ for func in "${!FUNCTION_CALLS[@]}"; do
     fi
 done
 
-echo -e "${GREEN}✓ Found ${#FUNCTION_DEFINITIONS[@]} function definitions${RESET}\n"
+echo -e "${GREEN}✓ Found ${#FUNCTION_DEFINITIONS[@]} regular function definitions${RESET}\n"
 
-# Step 3: Verify each function call has a valid definition
-print_banner "PHASE 3: VALIDATING FUNCTION CALLS" "$PURPLE" 
+# Step 4: Verify each function call has a valid definition
+print_banner "PHASE 4: VALIDATING FUNCTION CALLS" "$CYAN" 
 
 # Known false positives to ignore
 declare -A FALSE_POSITIVES
@@ -452,6 +485,7 @@ echo -e "${CYAN}Checking each function against allowed list and definitions...${
 VIOLATIONS_FOUND=0
 VALID_CALLS=0
 ALLOWED_CALLS=0
+STATIC_CALLS=0
 
 echo -e "\n${BOLD}Function validation results:${RESET}\n"
 echo -e "┌─────────────────────────────────────────────────────────────┐"
@@ -471,6 +505,11 @@ for func in "${!FUNCTION_CALLS[@]}"; do
     if printf '%s\n' "${ALLOWED_FUNCTIONS[@]}" | grep -q -x "$func"; then
         ((ALLOWED_CALLS++))
         echo "ALLOWED  $func (standard library)" >> "$TEMP_RESULTS"
+        # Save call locations for reporting
+        IFS=',' read -ra locations <<< "${FUNCTION_CALL_LOCATIONS[$func]}"
+        for loc in "${locations[@]}"; do
+            echo "ALLOWED_CALL $func $loc" >> "$TEMP_RESULTS"
+        done
         continue
     fi
     
@@ -489,10 +528,53 @@ for func in "${!FUNCTION_CALLS[@]}"; do
         continue
     fi
     
+    # Check if this is a static function
+    if [[ -n "${STATIC_FUNCTIONS[$func]}" ]]; then
+        staticFile="${STATIC_FUNCTIONS_FILE[$func]}"
+        valid_static=1
+        
+        # Check if all calls to this static function are from the same file
+        IFS=',' read -ra locations <<< "${FUNCTION_CALL_LOCATIONS[$func]}"
+        for loc in "${locations[@]}"; do
+            call_file=$(echo "$loc" | cut -d: -f1)
+            if [[ "$call_file" != "$staticFile" ]]; then
+                valid_static=0
+                break
+            fi
+        done
+        
+        if [[ $valid_static -eq 1 ]]; then
+            ((STATIC_CALLS++))
+            echo "STATIC   $func (defined in $staticFile)" >> "$TEMP_RESULTS"
+            # Save call locations for reporting
+            for loc in "${locations[@]}"; do
+                echo "STATIC_CALL $func $loc" >> "$TEMP_RESULTS"
+            done
+        else
+            ((VIOLATIONS_FOUND++))
+            echo "ERROR    $func (static function called from different file)" >> "$TEMP_RESULTS"
+            # Print locations with validation
+            for loc in "${locations[@]}"; do
+                call_file=$(echo "$loc" | cut -d: -f1)
+                if [[ "$call_file" != "$staticFile" ]]; then
+                    echo "CALL     $func $loc (INVALID: static function from $staticFile called outside its file)" >> "$TEMP_RESULTS"
+                else
+                    echo "CALL     $func $loc (valid: called within same file)" >> "$TEMP_RESULTS"
+                fi
+            done
+        fi
+        continue
+    fi
+    
     # Check if this function has a definition in our codebase
     if [[ -n "${FUNCTION_DEFINITIONS[$func]}" ]]; then
         ((VALID_CALLS++))
         echo "OK       $func (${FUNCTION_DEF_LOCATIONS[$func]})" >> "$TEMP_RESULTS"
+        # Save call locations for reporting
+        IFS=',' read -ra locations <<< "${FUNCTION_CALL_LOCATIONS[$func]}"
+        for loc in "${locations[@]}"; do
+            echo "OK_CALL  $func $loc" >> "$TEMP_RESULTS"
+        done
         continue
     fi
     
@@ -503,9 +585,7 @@ for func in "${!FUNCTION_CALLS[@]}"; do
     # Print locations where this function is called
     IFS=',' read -ra locations <<< "${FUNCTION_CALL_LOCATIONS[$func]}"
     for loc in "${locations[@]}"; do
-        file=$(echo "$loc" | cut -d: -f1)
-        line=$(echo "$loc" | cut -d: -f2)
-        echo "CALL     $func $file:$line" >> "$TEMP_RESULTS"
+        echo "CALL     $func $loc" >> "$TEMP_RESULTS"
     done
 done
 
@@ -519,16 +599,35 @@ sort "$TEMP_RESULTS" | while read -r line; do
             echo -e "│ ${BLUE}⚡ IGNORED${RESET}   $content" ;;
         "ALLOWED")
             echo -e "│ ${GREEN}✓ ALLOWED${RESET}   $content" ;;
+        "ALLOWED_CALL")
+            func=$(echo "$content" | cut -d' ' -f1)
+            loc=$(echo "$content" | cut -d' ' -f2-)
+            echo -e "│      ${GREEN}└─ Called in $loc${RESET}" ;;
+        "STATIC")
+            echo -e "│ ${CYAN}ⓢ STATIC${RESET}    $content" ;;
+        "STATIC_CALL")
+            func=$(echo "$content" | cut -d' ' -f1)
+            loc=$(echo "$content" | cut -d' ' -f2-)
+            echo -e "│      ${CYAN}└─ Called in $loc${RESET}" ;;
         "OK")
             echo -e "│ ${GREEN}✓ OK${RESET}        $content" ;;
+        "OK_CALL")
+            func=$(echo "$content" | cut -d' ' -f1)
+            loc=$(echo "$content" | cut -d' ' -f2-)
+            echo -e "│      ${GREEN}└─ Called in $loc${RESET}" ;;
         "ERROR")
             echo -e "│ ${RED}❌ ERROR${RESET}     $content" ;;
         "PROHIBITED")
             echo -e "│ ${RED}⛔ PROHIBITED${RESET} $content" ;;
         "CALL")
-            func=$(echo "$content" | cut -d' ' -f1)
-            loc=$(echo "$content" | cut -d' ' -f2-)
-            echo -e "│      ${RED}└─ Called in $loc${RESET}" ;;
+            if [[ "$content" == *"INVALID"* ]]; then
+                echo -e "│      ${RED}└─ $content${RESET}"
+            elif [[ "$content" == *"valid"* ]]; then
+                echo -e "│      ${GREEN}└─ $content${RESET}"
+            else
+                echo -e "│      ${RED}└─ Called in $content${RESET}"
+            fi
+            ;;
     esac
 done
 
@@ -544,6 +643,8 @@ print_banner "VALIDATION REPORT" "$CYAN"
 echo -e "  ${BOLD}Total function calls detected:${RESET}    ${#FUNCTION_CALLS[@]}"
 echo -e "  ${BOLD}Standard library calls:${RESET}           $ALLOWED_CALLS"
 echo -e "  ${BOLD}User-defined functions:${RESET}           $VALID_CALLS"
+echo -e "  ${BOLD}Static functions:${RESET}                 ${#STATIC_FUNCTIONS[@]}"
+echo -e "  ${BOLD}Static function calls:${RESET}            $STATIC_CALLS"
 echo -e "  ${BOLD}Problematic functions:${RESET}            $VIOLATIONS_FOUND"
 echo -e "  ${BOLD}Function definitions found:${RESET}       ${#FUNCTION_DEFINITIONS[@]}"
 
@@ -566,4 +667,4 @@ else
     echo -e "${RED}║                                                                ${RESET}"
     echo -e "${RED}╚════════════════════════════════════════════════════════════════${RESET}\n"
     exit 1
-fi
+fi+
